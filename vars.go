@@ -12,6 +12,7 @@ var (
 	flagAuthUSER       = flag.String("user", "", "user for smtp client")
 	flagAuthPASS       = flag.String("pass", "", "pass for smtp client")
 	flagDomain         = flag.String("domain", "", "domain for recieving mails")
+	flagMailgunAPIKey  = flag.String("mailgun.apikey", "", "Mailgun API key for sending emails")
 )
 
 func init() {

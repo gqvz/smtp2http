@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -27,71 +26,86 @@ func main() {
 				return errors.New("Cannot read your message: " + err.Error())
 			}
 
-			spfResult, _, _ := c.SPF()
+			// this is completely chatgpt'd
+			from := transformStdAddressToEmailAddress([]*mail.Address{c.From()})[0]
+			to := transformStdAddressToEmailAddress([]*mail.Address{c.To()})[0]
 
-			jsonData := EmailMessage{
-				ID:            msg.MessageID,
-				Date:          msg.Date.String(),
-				References:    msg.References,
-				SPFResult:     spfResult.String(),
-				ResentDate:    msg.ResentDate.String(),
-				ResentID:      msg.ResentMessageID,
-				Subject:       msg.Subject,
-				Attachments:   []*EmailAttachment{},
-				EmbeddedFiles: []*EmailEmbeddedFile{},
+			cc := transformStdAddressToEmailAddress(msg.Cc)
+			bcc := transformStdAddressToEmailAddress(msg.Bcc)
+
+			apiKey := *flagMailgunAPIKey
+			apiUrl := *flagWebhook
+
+			client := resty.New()
+			request := client.R().
+				SetBasicAuth("api", apiKey).
+				SetHeader("Content-Type", "multipart/form-data")
+
+			form := map[string]string{
+				"from":    fmt.Sprintf("%s <%s>", from.Name, from.Address),
+				"to":      to.Address,
+				"subject": msg.Subject,
+				"text":    string(msg.TextBody),
+				"html":    string(msg.HTMLBody),
 			}
 
-			jsonData.Body.HTML = string(msg.HTMLBody)
-			jsonData.Body.Text = string(msg.TextBody)
-
-			jsonData.Addresses.From = transformStdAddressToEmailAddress([]*mail.Address{c.From()})[0]
-			jsonData.Addresses.To = transformStdAddressToEmailAddress([]*mail.Address{c.To()})[0]
-
-			toSplited := strings.Split(jsonData.Addresses.To.Address, "@")
-			if len(*flagDomain) > 0 && (len(toSplited) < 2 || toSplited[1] != *flagDomain) {
-				log.Println("domain not allowed")
-				log.Println(*flagDomain)
-				return errors.New("Unauthorized TO domain")
+			// Optional fields
+			if len(cc) > 0 {
+				var ccList []string
+				for _, a := range cc {
+					ccList = append(ccList, a.Address)
+				}
+				form["cc"] = strings.Join(ccList, ",")
+			}
+			if len(bcc) > 0 {
+				var bccList []string
+				for _, a := range bcc {
+					bccList = append(bccList, a.Address)
+				}
+				form["bcc"] = strings.Join(bccList, ",")
 			}
 
-			jsonData.Addresses.Cc = transformStdAddressToEmailAddress(msg.Cc)
-			jsonData.Addresses.Bcc = transformStdAddressToEmailAddress(msg.Bcc)
-			jsonData.Addresses.ReplyTo = transformStdAddressToEmailAddress(msg.ReplyTo)
-			jsonData.Addresses.InReplyTo = msg.InReplyTo
-
-			if resentFrom := transformStdAddressToEmailAddress(msg.ResentFrom); len(resentFrom) > 0 {
-				jsonData.Addresses.ResentFrom = resentFrom[0]
+			if len(msg.ReplyTo) > 0 {
+				var replyTos []string
+				for _, rt := range msg.ReplyTo {
+					if rt.Name != "" {
+						replyTos = append(replyTos, fmt.Sprintf("%s <%s>", rt.Name, rt.Address))
+					} else {
+						replyTos = append(replyTos, rt.Address)
+					}
+				}
+				form["h:Reply-To"] = strings.Join(replyTos, ", ")
 			}
 
-			jsonData.Addresses.ResentTo = transformStdAddressToEmailAddress(msg.ResentTo)
-			jsonData.Addresses.ResentCc = transformStdAddressToEmailAddress(msg.ResentCc)
-			jsonData.Addresses.ResentBcc = transformStdAddressToEmailAddress(msg.ResentBcc)
+			if len(msg.InReplyTo) > 0 {
+				form["h:In-Reply-To"] = strings.Join(msg.InReplyTo, " ")
+			}
+
+			if len(msg.References) > 0 {
+				form["h:References"] = strings.Join(msg.References, " ")
+			}
+
+			request.SetFormData(form)
 
 			for _, a := range msg.Attachments {
 				data, _ := ioutil.ReadAll(a.Data)
-				jsonData.Attachments = append(jsonData.Attachments, &EmailAttachment{
-					Filename:    a.Filename,
-					ContentType: a.ContentType,
-					Data:        base64.StdEncoding.EncodeToString(data),
-				})
+				request.SetFileReader("attachment", a.Filename, strings.NewReader(string(data)))
 			}
 
 			for _, a := range msg.EmbeddedFiles {
 				data, _ := ioutil.ReadAll(a.Data)
-				jsonData.EmbeddedFiles = append(jsonData.EmbeddedFiles, &EmailEmbeddedFile{
-					CID:         a.CID,
-					ContentType: a.ContentType,
-					Data:        base64.StdEncoding.EncodeToString(data),
-				})
+				request.SetFileReader("inline", a.CID, strings.NewReader(string(data)))
+				form["inline"] = a.CID
 			}
 
-			resp, err := resty.New().R().SetHeader("Content-Type", "application/json").SetBody(jsonData).Post(*flagWebhook)
+			// Send request
+			resp, err := request.Post(apiUrl)
 			if err != nil {
 				log.Println(err)
-				return errors.New("E1: Cannot accept your message due to internal error, please report that to our engineers")
-			} else if resp.StatusCode() != 200 {
-				log.Println(resp.Status())
-				return errors.New("E2: Cannot accept your message due to internal error, please report that to our engineers")
+				return errors.New("e1: Cannot send via Mailgun")
+			} else if resp.StatusCode() >= 300 {
+				log.Printf("Mailgun error: %s - %s\n", resp.Status(), string(resp.Body()))
+				return errors.New("e2: Mailgun rejected the message")
 			}
 
 			return nil
